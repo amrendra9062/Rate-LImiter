@@ -2,10 +2,12 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"rate-limiter/limiter"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
@@ -20,11 +22,26 @@ func main() {
 	rateLimitMiddleware := func(c *gin.Context) {
 		ip := c.ClientIP()
 
-		allowed, remaining, resetTime, retryMs, err := rl.Allow(ip)
+		var allowed bool
+		var remaining, resetTime, retryMs int64
+		var err error
 
+		// 5-attempt retry with brief exponential backoff (10ms, 20ms, 40ms, 80ms)
+		const maxRetries = 5
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			allowed, remaining, resetTime, retryMs, err = rl.Allow(ip)
+			if err == nil {
+				break
+			}
+			if attempt < maxRetries-1 {
+				time.Sleep(time.Duration(10*(1<<attempt)) * time.Millisecond)
+			}
+		}
+
+		// Fail-open: if Redis is still unreachable, log and allow traffic through
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-			c.Abort()
+			log.Printf("[WARN] Rate limiter failed after %d attempts for IP %s (failing open): %v", maxRetries, ip, err)
+			c.Next()
 			return
 		}
 
@@ -32,7 +49,7 @@ func main() {
 		c.Header("X-RateLimit-Reset", strconv.FormatInt(resetTime, 10))
 
 		if !allowed {
-			//Ensure at least 1ms safety
+			// Ensure at least 1ms safety
 			if retryMs <= 0 {
 				retryMs = 1
 			}
@@ -42,10 +59,8 @@ func main() {
 
 			var retryStr string
 			if retryMs >= 1000 {
-				//Convert to seconds with 2 decimal places (e.g. :- 1250ms -> "1.25s")
 				retryStr = fmt.Sprintf("%.2fs", float64(retryMs)/1000.0)
 			} else {
-				//Keep in milliseconds (e.g. 200ms -> "200ms")
 				retryStr = fmt.Sprintf("%dms", retryMs)
 			}
 
